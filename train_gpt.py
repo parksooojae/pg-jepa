@@ -55,7 +55,6 @@ class Hyperparameters:
     val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 64))
     val_sliding_batch = int(os.environ.get("VAL_SLIDING_BATCH", 8))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -1575,9 +1574,6 @@ def main() -> None:
         name: t.detach().float().clone()
         for name, t in base_model.state_dict().items()
     }
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1668,18 +1664,6 @@ def main() -> None:
                 ema_state[name].mul_(args.ema_decay).add_(
                     t.detach().float(), alpha=1.0 - args.ema_decay
                 )
-            if scale < 0.2 and (step + 1) % args.swa_every == 0:
-                if swa_state is None:
-                    swa_state = {
-                        name: t.detach().float().clone()
-                        for name, t in base_model.state_dict().items()
-                    }
-                    swa_count = 1
-                else:
-                    for name, t in base_model.state_dict().items():
-                        swa_state[name] += t.detach().float()
-                    swa_count += 1
-
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = args.train_log_every > 0 and (
@@ -1711,19 +1695,11 @@ def main() -> None:
     )
 
     current_sd = base_model.state_dict()
-    if swa_state is not None and swa_count > 1:
-        swa_avg = {
-            name: (t / swa_count).to(dtype=current_sd[name].dtype)
-            for name, t in swa_state.items()
-        }
-        base_model.load_state_dict(swa_avg, strict=True)
-        log0(f"swa:applied SWA weights ({swa_count} snapshots, every {args.swa_every} steps)")
-    else:
-        ema_avg = {
-            name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()
-        }
-        base_model.load_state_dict(ema_avg, strict=True)
-        log0(f"ema:applied EMA weights (decay={args.ema_decay})")
+    ema_avg = {
+        name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()
+    }
+    base_model.load_state_dict(ema_avg, strict=True)
+    log0(f"ema:applied EMA weights (decay={args.ema_decay})")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
