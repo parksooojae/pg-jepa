@@ -53,13 +53,13 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_160))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 64))
+    val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 256))
     val_sliding_batch = int(os.environ.get("VAL_SLIDING_BATCH", 32))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 1))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
@@ -460,13 +460,12 @@ def eval_val_sliding_ttt(
     frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
     ttt_params = []
     for name, p in base_model.named_parameters():
-        is_decoder = name.startswith("decoder_") or name.startswith("start_latent")
-        freeze_block = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
-        if is_decoder and not freeze_block:
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
             p.requires_grad_(True)
             ttt_params.append(p)
-        else:
-            p.requires_grad_(False)
 
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
