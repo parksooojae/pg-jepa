@@ -863,9 +863,8 @@ class BytePatchJEPA(nn.Module):
         self.predictor = LatentMLP(model_dim, latent_dim)
         self.sigreg = SIGReg(knots=sigreg_knots, num_proj=sigreg_num_proj)
 
-        self.start_latent = nn.Parameter(torch.zeros(latent_dim, dtype=torch.float32))
+        self.start_context = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
         self.decoder_token_emb = nn.Embedding(vocab_size, model_dim)
-        self.decoder_cond = CastedLinear(latent_dim, model_dim, bias=False)
         self.decoder_blocks = nn.ModuleList(
             [
                 Block(
@@ -887,7 +886,7 @@ class BytePatchJEPA(nn.Module):
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.decoder_token_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.patch_pos, mean=0.0, std=0.02)
-        nn.init.normal_(self.start_latent, mean=0.0, std=0.02)
+        nn.init.normal_(self.start_context, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -938,8 +937,7 @@ class BytePatchJEPA(nn.Module):
             [flat_bytes.new_full((bsz, 1), self.bos_id), flat_bytes[:, :-1]], dim=1
         )
         x = self.decoder_token_emb(prev)
-        cond = self.decoder_cond(cond_latent).to(dtype=x.dtype)
-        x = x + cond.repeat_interleave(patch_size, dim=1)
+        x = x + cond_latent.to(dtype=x.dtype).repeat_interleave(patch_size, dim=1)
         x0 = x
         for block in self.decoder_blocks:
             x = block(x, x0)
@@ -962,11 +960,11 @@ class BytePatchJEPA(nn.Module):
         )
         sigreg_loss = self.sigreg(target_latent.transpose(0, 1))
 
-        start = self.start_latent.to(dtype=pred_latent.dtype)[None, None, :].expand(
+        start = self.start_context.to(dtype=context.dtype)[None, None, :].expand(
             patches.size(0), 1, -1
         )
-        cond_latent = torch.cat((start, pred_latent), dim=1)
-        logits = self._decode_logits(cond_latent, patches)
+        cond_context = torch.cat((start, context[:, :-1]), dim=1)
+        logits = self._decode_logits(cond_context, patches)
         ce = F.cross_entropy(
             logits.reshape(-1, self.vocab_size).float(),
             patches.reshape(-1),
