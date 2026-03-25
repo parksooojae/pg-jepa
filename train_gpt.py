@@ -957,7 +957,7 @@ class BytePatchJEPA(nn.Module):
         context = self._contextualize(patch_emb)
         pred_latent = self.predictor(context[:, :-1])
         pred_loss = F.mse_loss(
-            pred_latent.float(), target_latent[:, 1:].detach().float(), reduction="mean"
+            pred_latent.float(), target_latent[:, 1:].float(), reduction="mean"
         )
         sigreg_loss = self.sigreg(target_latent.transpose(0, 1))
 
