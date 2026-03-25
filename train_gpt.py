@@ -88,7 +88,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     patch_size = int(os.environ.get("PATCH_SIZE", 8))
     latent_dim = int(os.environ.get("LATENT_DIM", 192))
-    decoder_layers = int(os.environ.get("DECODER_LAYERS", 8))
+    decoder_layers = int(os.environ.get("DECODER_LAYERS", 7))
     decoder_heads = int(os.environ.get("DECODER_HEADS", 4))
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.02))
     sigreg_knots = int(os.environ.get("SIGREG_KNOTS", 17))
