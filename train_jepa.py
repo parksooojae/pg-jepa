@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import wandb
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -48,6 +49,7 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_pure_byte_260.json")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    wandb_project = os.environ.get("WANDB_PROJECT", "paramgolf")
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -345,11 +347,11 @@ def eval_val_sliding_ttt(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # TTT: only adapt decoder parameters, freeze encoder
+    # TTT: adapt global+decoder parameters, freeze token embeddings and encoder
     ttt_params = [
         p for n, p in base_model.named_parameters()
         if p.requires_grad and not n.startswith("tok_emb.") and not n.startswith("hash_emb.")
-        and not n.startswith("encoder_") and not n.startswith("global_")
+        and not n.startswith("encoder_")
     ]
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
@@ -1220,6 +1222,27 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    wandb_run = None
+    if master_process:
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.run_id,
+            config={
+                "run_id": args.run_id,
+                "data_path": args.data_path,
+                "tokenizer_path": args.tokenizer_path,
+                "vocab_size": args.vocab_size,
+                "iterations": args.iterations,
+                "train_batch_tokens": args.train_batch_tokens,
+                "train_seq_len": args.train_seq_len,
+                "model_dim": args.model_dim,
+                "num_unique_global_blocks": args.num_unique_global_blocks,
+                "num_global_cycles": args.num_global_cycles,
+                "decoder_layers": args.decoder_layers,
+                "max_wallclock_seconds": args.max_wallclock_seconds,
+            },
+        )
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -1415,6 +1438,16 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/bpb": val_bpb,
+                        "time/train_ms": training_time_ms,
+                        "time/step_avg_ms": training_time_ms / max(step, 1),
+                    },
+                    step=step,
+                )
 
             if ema is not None and ema_backup is not None:
                 ema.restore(base_model, ema_backup)
@@ -1494,6 +1527,18 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f" lr_scale:{scale:.4f} jepa_scale:{jepa_scale:.4f}"
             )
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "train/loss": float(train_loss.item()),
+                        "train/lr_scale": float(scale),
+                        "train/jepa_scale": float(jepa_scale),
+                        "train/qat_active": int(qat_active),
+                        "time/train_ms": approx_training_time_ms,
+                        "time/step_avg_ms": approx_training_time_ms / step,
+                    },
+                    step=step,
+                )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
@@ -1565,6 +1610,14 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_8_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if wandb_run is not None:
+        wandb.log(
+            {
+                "final/roundtrip_val_loss": float(q_val_loss),
+                "final/roundtrip_val_bpb": float(q_val_bpb),
+            },
+            step=step,
+        )
     if args.ttt_enabled:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
@@ -1579,6 +1632,17 @@ def main() -> None:
             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
         )
         log0(f"final_int6_8_lzma_ttt_roundtrip_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "final/ttt_roundtrip_val_loss": float(ttt_val_loss),
+                    "final/ttt_roundtrip_val_bpb": float(ttt_val_bpb),
+                },
+                step=step,
+            )
+
+    if wandb_run is not None:
+        wandb.finish()
 
     if distributed:
         dist.destroy_process_group()
