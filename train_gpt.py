@@ -460,12 +460,13 @@ def eval_val_sliding_ttt(
     frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
     ttt_params = []
     for name, p in base_model.named_parameters():
-        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
-        if freeze:
-            p.requires_grad_(False)
-        else:
+        is_decoder = name.startswith("decoder_") or name.startswith("start_latent")
+        freeze_block = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if is_decoder and not freeze_block:
             p.requires_grad_(True)
             ttt_params.append(p)
+        else:
+            p.requires_grad_(False)
 
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
@@ -1787,6 +1788,7 @@ def main() -> None:
     )
 
     if args.ttt_enabled:
+        CastedLinear._qat_enabled = False
         deq_sd = dequantize_mixed_int6(
             quant_state["w"], quant_state["m"], template_sd
         )
