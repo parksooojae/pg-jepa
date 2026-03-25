@@ -41,7 +41,11 @@ def load_sp1024_tokens(path: str) -> np.ndarray:
 
 def decode_and_convert(sp: spm.SentencePieceProcessor, tokens: np.ndarray) -> np.ndarray:
     """Decode sp1024 tokens to text, then encode as bytes."""
+    vocab_size = sp.get_piece_size()
     token_list = tokens.tolist()
+    
+    # Debug: show token range
+    print(f"  Token range: min={min(token_list)}, max={max(token_list)}, vocab_size={vocab_size}")
     
     # Decode in chunks to avoid memory issues
     chunk_size = 100_000
@@ -49,8 +53,8 @@ def decode_and_convert(sp: spm.SentencePieceProcessor, tokens: np.ndarray) -> np
     
     for i in range(0, len(token_list), chunk_size):
         chunk = token_list[i:i + chunk_size]
-        # Filter out BOS/EOS tokens before decoding
-        chunk = [t for t in chunk if t not in (1, 2)]
+        # Filter out tokens that are out of vocab range (special tokens like BOS/EOS/PAD)
+        chunk = [t for t in chunk if t < vocab_size]
         if chunk:
             text = sp.decode(chunk)
             # Convert text to bytes (UTF-8)
