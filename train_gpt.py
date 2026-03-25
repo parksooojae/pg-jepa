@@ -66,7 +66,8 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
+    encoder_repeats = int(os.environ.get("ENCODER_REPEATS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 3))
     model_dim = int(os.environ.get("MODEL_DIM", 384))
     num_heads = int(os.environ.get("NUM_HEADS", 6))
@@ -74,7 +75,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     patch_size = int(os.environ.get("PATCH_SIZE", 8))
     latent_dim = int(os.environ.get("LATENT_DIM", 192))
-    decoder_layers = int(os.environ.get("DECODER_LAYERS", 2))
+    decoder_layers = int(os.environ.get("DECODER_LAYERS", 6))
     decoder_heads = int(os.environ.get("DECODER_HEADS", 4))
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.02))
     sigreg_knots = int(os.environ.get("SIGREG_KNOTS", 17))
@@ -807,6 +808,7 @@ class BytePatchJEPA(nn.Module):
         *,
         vocab_size: int,
         num_layers: int,
+        encoder_repeats: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -832,6 +834,7 @@ class BytePatchJEPA(nn.Module):
             )
         self.vocab_size = vocab_size
         self.patch_size = patch_size
+        self.encoder_repeats = encoder_repeats
         self.sigreg_weight = sigreg_weight
         self.jepa_pred_weight = jepa_pred_weight
         self.jepa_ce_weight = jepa_ce_weight
@@ -922,8 +925,9 @@ class BytePatchJEPA(nn.Module):
     def _contextualize(self, patch_emb: Tensor) -> Tensor:
         x = F.rms_norm(patch_emb, (patch_emb.size(-1),))
         x0 = x
-        for block in self.blocks:
-            x = block(x, x0)
+        for _ in range(self.encoder_repeats):
+            for block in self.blocks:
+                x = block(x, x0)
         return self.final_norm(x)
 
     def _decode_logits(self, cond_latent: Tensor, target_patches: Tensor) -> Tensor:
@@ -1094,6 +1098,7 @@ def main() -> None:
     base_model: nn.Module = BytePatchJEPA(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        encoder_repeats=args.encoder_repeats,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -1208,6 +1213,7 @@ def main() -> None:
     )
     log0(
         f"jepa:patch_size:{args.patch_size} latent_dim:{args.latent_dim} "
+        f"encoder_layers:{args.num_layers}x{args.encoder_repeats} "
         f"decoder_layers:{args.decoder_layers} decoder_heads:{args.decoder_heads} "
         f"sigreg_weight:{args.sigreg_weight} pred_weight:{args.jepa_pred_weight} ce_weight:{args.jepa_ce_weight}"
     )
