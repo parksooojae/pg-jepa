@@ -1,7 +1,17 @@
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+Based on PR#696 (gravelBridge):
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+(1) vectorized chunk_reduce (no Python loop over batch dim)
+(2) additive conditioning replaces cross-attention decoder (saves ~40% decoder params)
+(3) fixed-stride patching replaces learned boundary prediction (simpler, faster)
+(4) leakyReLU(0.5)² activation (matching SOTA)
+(5) EMA weight averaging (decay=0.997)
+(6) QAT (quantization-aware training) during warmdown
+(7) JEPA loss annealing (full early → zero at convergence)
+(8) SOTA optimizer hyperparameters (Muon momentum=0.99, warmdown=3500)
+(9) Gaussian latent regularizer (from LeWM: mean→0, var→1, decorrelation)
+(10) more decoder layers (9 vs 7, using saved cross-attention params)
+(11) sliding window eval with stride=256
 """
 
 from __future__ import annotations
@@ -30,16 +40,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default JEPA baseline run:
-# - token+hash embedding dim 128, causal conv encoder to dim 480
-# - learned chunk boundaries with hard-threshold STE boundary gate
-# - 6 unique global blocks cycled twice (12 effective layers), dim 480
-# - 2-layer decoder transformer at dim 256 with cross-attention to globals
-# - CE token loss + training-time JEPA next-chunk prediction loss
 
 
 class Hyperparameters:
-    # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -47,7 +50,6 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 256))
@@ -60,16 +62,16 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
-    # Training length.
+    # Training length — SOTA-matched warmdown
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))  # was 1200
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape.
+    # Model shape
     vocab_size = int(os.environ.get("VOCAB_SIZE", 260))
     model_dim = int(os.environ.get("MODEL_DIM", 480))
     encoder_token_dim = int(os.environ.get("ENCODER_TOKEN_DIM", 128))
@@ -80,27 +82,38 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
+    # Decoder: more layers now that cross-attention is removed
     decoder_dim = int(os.environ.get("DECODER_DIM", 480))
-    decoder_layers = int(os.environ.get("DECODER_LAYERS", 7))
+    decoder_layers = int(os.environ.get("DECODER_LAYERS", 9))  # was 7
     decoder_heads = int(os.environ.get("DECODER_HEADS", 8))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
 
-    # Boundary predictor / JEPA.
-    boundary_threshold = float(os.environ.get("BOUNDARY_THRESHOLD", 0.45))
-    boundary_temperature = float(os.environ.get("BOUNDARY_TEMPERATURE", 12.0))
+    # Fixed-stride patching (replaces learned boundary prediction)
+    patch_size = int(os.environ.get("PATCH_SIZE", 8))
+
+    # JEPA loss (annealed during warmdown)
     jepa_weight = float(os.environ.get("JEPA_WEIGHT", 0.10))
+    jepa_anneal = bool(int(os.environ.get("JEPA_ANNEAL", "1")))  # anneal to 0
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.10))
 
-    # Optimizer hyperparameters.
+    # EMA weight averaging
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+
+    # QAT (quantization-aware training)
+    qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.15))  # lr_scale threshold
+
+    # Optimizer hyperparameters — SOTA-matched
     embed_lr = float(os.environ.get("EMBED_LR", 0.30))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))  # was 0.95
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))  # was 0.85
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))  # was 500
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -110,14 +123,9 @@ class Hyperparameters:
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
-#
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -173,7 +181,6 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -193,11 +200,6 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 
 def build_pure_byte_luts(vocab_size: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
@@ -235,7 +237,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -255,9 +256,6 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -347,7 +345,12 @@ def eval_val_sliding_ttt(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    # TTT: only adapt decoder parameters, freeze encoder
+    ttt_params = [
+        p for n, p in base_model.named_parameters()
+        if p.requires_grad and not n.startswith("tok_emb.") and not n.startswith("hash_emb.")
+        and not n.startswith("encoder_") and not n.startswith("global_")
+    ]
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
     t_infer_total = 0.0
@@ -465,15 +468,12 @@ def eval_val_sliding_ttt(
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
-#
-# We quantize "middle" global blocks to int6 and all other large float tensors to int8,
-# then compress with LZMA preset 9 to target a tighter submission size.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,boundary_threshold",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain",
     ).split(",")
     if pattern
 )
@@ -506,13 +506,16 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 
 
 def choose_quant_bits(name: str) -> int:
-    # "Middle" unique global blocks (1..4) use int6. Everything else defaults to int8.
+    # Global transformer middle blocks and MLP weights use int6 for max compression.
     if name.startswith("global_transformer.blocks."):
         parts = name.split(".")
         if len(parts) > 2 and parts[2].isdigit():
             idx = int(parts[2])
             if 1 <= idx <= 4:
                 return 6
+    # Decoder MLP weights also use int6 for tighter compression
+    if "decoder_blocks" in name and "mlp" in name and "weight" in name:
+        return 6
     return 8
 
 
@@ -534,6 +537,26 @@ def quantize_float_tensor(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
     scale = torch.tensor(clip_abs / max_q if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_q, max_q).to(torch.int8).contiguous()
     return q, scale
+
+
+# ---- STE QAT helper ----
+def ste_quantize_weight(w: Tensor, bits: int) -> Tensor:
+    """Simulate quantization noise with straight-through estimator."""
+    max_q = (1 << (bits - 1)) - 1
+    w32 = w.float()
+    if w32.ndim == 2:
+        clip_abs = torch.quantile(w32.abs(), INTX_CLIP_Q, dim=1).clamp_min(1e-8)
+        scale = clip_abs / max_q
+        clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
+        q = torch.round(clipped / scale[:, None]).clamp(-max_q, max_q)
+        deq = q * scale[:, None]
+    else:
+        clip_abs = torch.quantile(w32.abs().flatten(), INTX_CLIP_Q).clamp_min(1e-8)
+        scale = clip_abs / max_q
+        q = torch.round(torch.clamp(w32, -clip_abs, clip_abs) / scale).clamp(-max_q, max_q)
+        deq = q * scale
+    # STE: forward uses quantized, backward uses original
+    return w + (deq.to(w.dtype) - w).detach()
 
 
 def quantize_state_dict_intx(state_dict: dict[str, Tensor]):
@@ -614,7 +637,6 @@ def dequantize_state_dict_intx(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         bits = int(bitwidths.get(name, 8))
-        _ = (1 << (bits - 1)) - 1  # kept for explicitness of per-tensor quant range
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
@@ -640,7 +662,6 @@ def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
@@ -654,8 +675,6 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -685,8 +704,6 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -719,14 +736,12 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -734,7 +749,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -804,50 +818,15 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
+            q, k, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim: int, kv_dim: int, num_heads: int):
-        super().__init__()
-        if query_dim % num_heads != 0:
-            raise ValueError("query_dim must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.head_dim = query_dim // num_heads
-        self.q = CastedLinear(query_dim, query_dim, bias=False)
-        self.k = CastedLinear(kv_dim, query_dim, bias=False)
-        self.v = CastedLinear(kv_dim, query_dim, bias=False)
-        self.proj = CastedLinear(query_dim, query_dim, bias=False)
-        self.proj._zero_init = True
-
-    def forward(self, x: Tensor, memory: Tensor, memory_mask: Tensor) -> Tensor:
-        bsz, t_q, d_q = x.shape
-        t_k = memory.size(1)
-        q = self.q(x).reshape(bsz, t_q, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k(memory).reshape(bsz, t_k, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v(memory).reshape(bsz, t_k, self.num_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        attn_bias = torch.where(
-            memory_mask[:, None, :, :],
-            torch.zeros((), device=x.device, dtype=q.dtype),
-            torch.full((), -1e4, device=x.device, dtype=q.dtype),
-        )
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, is_causal=False)
-        y = y.transpose(1, 2).contiguous().reshape(bsz, t_q, d_q)
-        return self.proj(y)
-
-
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    """LeakyReLU(0.5)² MLP — matches SOTA activation."""
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
@@ -856,7 +835,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -889,21 +868,19 @@ class Block(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, memory_dim: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+    """Simplified decoder block: causal self-attention + MLP.
+    Cross-attention replaced with additive chunk conditioning (applied externally)."""
+    def __init__(self, dim: int, num_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.self_norm = RMSNorm()
-        self.cross_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.self_attn = CausalSelfAttention(dim, num_heads, num_heads, rope_base, qk_gain_init)
-        self.cross_attn = CrossAttention(dim, memory_dim, num_heads)
         self.mlp = MLP(dim, mlp_mult)
         self.self_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.cross_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor, memory: Tensor, memory_mask: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         x = x + self.self_scale.to(dtype=x.dtype)[None, None, :] * self.self_attn(self.self_norm(x))
-        x = x + self.cross_scale.to(dtype=x.dtype)[None, None, :] * self.cross_attn(self.cross_norm(x), memory, memory_mask)
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -930,34 +907,49 @@ class HashNgramEmbedding(nn.Module):
         return self.trigram(tri_ids) + self.fourgram(four_ids)
 
 
-def ste_hard_threshold(prob: Tensor) -> Tensor:
-    hard = (prob > 0.5).to(prob.dtype)
-    return hard + prob - prob.detach()
-
-
-def chunk_reduce(x: Tensor, boundary_hard: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    # Build per-token chunk IDs from hard boundaries and average token features per chunk.
+# ---- IMPROVEMENT #1: Vectorized fixed-stride chunk reduce ----
+def chunk_reduce_fixed(x: Tensor, patch_size: int) -> tuple[Tensor, Tensor]:
+    """Vectorized chunk reduction with fixed stride — no Python loops."""
     bsz, seqlen, dim = x.shape
-    chunk_ids = torch.cumsum(boundary_hard.to(torch.int64), dim=1) - 1
-    num_chunks = chunk_ids[:, -1] + 1
-    max_chunks = int(num_chunks.max().item())
-    chunk_latents = x.new_zeros((bsz, max_chunks, dim))
-    chunk_counts = x.new_zeros((bsz, max_chunks, 1))
-    ones = x.new_ones((seqlen, 1))
-    for b in range(bsz):
-        ids = chunk_ids[b]
-        chunk_latents[b].index_add_(0, ids, x[b])
-        chunk_counts[b].index_add_(0, ids, ones)
-    chunk_latents = chunk_latents / chunk_counts.clamp_min_(1.0)
-    valid_chunk_mask = torch.arange(max_chunks, device=x.device)[None, :] < num_chunks[:, None]
-    return chunk_latents, chunk_ids, valid_chunk_mask
+    # Pad sequence to be divisible by patch_size
+    pad_len = (patch_size - seqlen % patch_size) % patch_size
+    if pad_len > 0:
+        x_padded = F.pad(x, (0, 0, 0, pad_len))
+    else:
+        x_padded = x
+    num_patches = x_padded.size(1) // patch_size
+    # Reshape and mean-pool: [B, num_patches, patch_size, dim] -> [B, num_patches, dim]
+    chunk_latents = x_padded.reshape(bsz, num_patches, patch_size, dim).mean(dim=2)
+    # Token-to-chunk mapping: each token maps to its patch index
+    token_chunk_ids = torch.arange(seqlen, device=x.device) // patch_size
+    token_chunk_ids = token_chunk_ids.unsqueeze(0).expand(bsz, -1)
+    return chunk_latents, token_chunk_ids
 
 
-def sigreg_loss(z: Tensor) -> Tensor:
+# ---- IMPROVEMENT #9: Gaussian latent regularizer (from LeWM) ----
+def gaussian_reg_loss(z: Tensor) -> Tensor:
+    """Enforce isotropic Gaussian distribution on chunk embeddings.
+    Combines: mean→0, variance→1, and off-diagonal covariance→0."""
     if z.numel() == 0:
         return z.new_zeros(())
-    std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
-    return F.relu(1.0 - std).mean()
+    # Flatten to [N, dim]
+    z_flat = z.reshape(-1, z.size(-1))
+    if z_flat.size(0) < 2:
+        return z.new_zeros(())
+    # Mean penalty
+    mean_pen = z_flat.mean(dim=0).pow(2).mean()
+    # Variance penalty (push toward 1)
+    var_pen = F.relu(1.0 - z_flat.var(dim=0, unbiased=False)).mean()
+    # Covariance penalty (decorrelation) — only if dim is small enough
+    dim = z_flat.size(-1)
+    if dim <= 512:
+        z_c = z_flat - z_flat.mean(dim=0)
+        cov = (z_c.T @ z_c) / max(z_flat.size(0) - 1, 1)
+        off_diag = cov.pow(2).mean() - cov.diag().pow(2).mean()
+        cov_pen = off_diag
+    else:
+        cov_pen = z.new_zeros(())
+    return mean_pen + var_pen + 0.01 * cov_pen
 
 
 class JEPAByteModel(nn.Module):
@@ -970,11 +962,11 @@ class JEPAByteModel(nn.Module):
 
         self.args = args
         self.logit_softcap = args.logit_softcap
-        self.boundary_temperature = args.boundary_temperature
         self.jepa_weight = args.jepa_weight
         self.sigreg_weight = args.sigreg_weight
+        self.patch_size = args.patch_size
 
-        # Encoder: token emb + trigram/4-gram hash emb -> causal conv (128 -> 480).
+        # Encoder: token emb + trigram/4-gram hash emb -> causal conv (128 -> model_dim).
         self.tok_emb = nn.Embedding(args.vocab_size, args.encoder_token_dim)
         self.hash_emb = HashNgramEmbedding(args.hash_buckets, args.encoder_token_dim)
         self.encoder_conv = nn.Conv1d(
@@ -985,9 +977,8 @@ class JEPAByteModel(nn.Module):
             bias=False,
         )
         self.encoder_norm = RMSNorm()
-        self.boundary_threshold = nn.Parameter(torch.tensor(args.boundary_threshold, dtype=torch.float32))
 
-        # Global transformer: 6 unique blocks reused for 2 cycles.
+        # Global transformer: depth-recurrent
         self.global_transformer = nn.ModuleDict(
             {
                 "blocks": nn.ModuleList(
@@ -1008,14 +999,15 @@ class JEPAByteModel(nn.Module):
         )
         self.num_global_cycles = args.num_global_cycles
 
-        # Decoder: 2 tiny blocks with causal self-attn + cross-attn to global chunks.
+        # IMPROVEMENT #2: Additive conditioning instead of cross-attention decoder.
+        # Project global chunks back to per-token conditioning signal.
+        self.chunk_to_token_proj = CastedLinear(args.model_dim, args.decoder_dim, bias=False)
         self.decoder_in = CastedLinear(args.model_dim, args.decoder_dim, bias=False)
         self.decoder_blocks = nn.ModuleList(
             [
                 DecoderBlock(
                     dim=args.decoder_dim,
                     num_heads=args.decoder_heads,
-                    memory_dim=args.model_dim,
                     mlp_mult=2,
                     rope_base=args.rope_base,
                     qk_gain_init=args.qk_gain_init,
@@ -1026,7 +1018,7 @@ class JEPAByteModel(nn.Module):
         self.decoder_norm = RMSNorm()
         self.lm_head = CastedLinear(args.decoder_dim, args.vocab_size, bias=False)
 
-        # JEPA head is training-only and intentionally excluded from export.
+        # JEPA predictor (training-only, excluded from export)
         self.jepa_predictor = nn.Sequential(
             RMSNorm(),
             CastedLinear(args.model_dim, args.model_dim, bias=False),
@@ -1041,7 +1033,7 @@ class JEPAByteModel(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _encoder_forward(self, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def _encoder_forward(self, input_ids: Tensor) -> Tensor:
         tok = self.tok_emb(input_ids)
         tok = tok + self.hash_emb(input_ids)
         tok = F.rms_norm(tok, (tok.size(-1),))
@@ -1049,28 +1041,15 @@ class JEPAByteModel(nn.Module):
         conv_in = F.pad(conv_in, (self.args.encoder_kernel_size - 1, 0))
         h = self.encoder_conv(conv_in).transpose(1, 2)
         h = self.encoder_norm(h)
+        return h
 
-        # Simplified H-Net style boundary predictor from adjacent cosine similarity.
-        left = F.normalize(h[:, :-1, :], dim=-1)
-        right = F.normalize(h[:, 1:, :], dim=-1)
-        cos_adj = (left * right).sum(dim=-1)
-        threshold = self.boundary_threshold.to(dtype=cos_adj.dtype)
-        boundary_prob = torch.sigmoid((threshold - cos_adj) * self.boundary_temperature)
-        boundary_mid = ste_hard_threshold(boundary_prob)
-        boundary_start = torch.ones((h.size(0), 1), device=h.device, dtype=h.dtype)
-        boundary = torch.cat((boundary_start, boundary_mid), dim=1)
-        boundary_hard = (boundary > 0.5).to(h.dtype)
-        return h, boundary, boundary_hard
-
-    def _global_forward(self, chunk_latents: Tensor, valid_chunk_mask: Tensor) -> Tensor:
+    def _global_forward(self, chunk_latents: Tensor) -> Tensor:
         x = chunk_latents
         x0 = x
         for _ in range(self.num_global_cycles):
             for block in self.global_transformer["blocks"]:
                 x = block(x, x0)
-                x = x * valid_chunk_mask[:, :, None].to(dtype=x.dtype)
         x = self.global_transformer["norm"](x)
-        x = x * valid_chunk_mask[:, :, None].to(dtype=x.dtype)
         return x
 
     def _decoder_forward(
@@ -1078,34 +1057,47 @@ class JEPAByteModel(nn.Module):
         token_latents: Tensor,
         global_chunks: Tensor,
         token_chunk_ids: Tensor,
-        valid_chunk_mask: Tensor,
     ) -> Tensor:
+        bsz, seqlen, _ = token_latents.shape
+
+        # Project token latents to decoder dim
         x = self.decoder_in(token_latents)
-        chunk_pos = torch.arange(global_chunks.size(1), device=global_chunks.device)[None, None, :]
-        allow = chunk_pos <= token_chunk_ids[:, :, None]
-        allow = allow & valid_chunk_mask[:, None, :]
+
+        # IMPROVEMENT #2: Additive conditioning from global chunks.
+        # Gather each token's chunk embedding and add it.
+        chunk_cond = self.chunk_to_token_proj(global_chunks)  # [B, num_chunks, decoder_dim]
+        # Shift chunk_ids by 1 to maintain causality: each token is conditioned
+        # on the *previous* chunk, not its own chunk.
+        shifted_ids = torch.clamp(token_chunk_ids - 1, min=0)  # [B, seqlen]
+        # Gather: [B, seqlen, decoder_dim]
+        cond = torch.gather(
+            chunk_cond,
+            dim=1,
+            index=shifted_ids.unsqueeze(-1).expand(-1, -1, chunk_cond.size(-1)),
+        )
+        # Zero out conditioning for tokens in the first chunk (no prior chunk)
+        first_chunk_mask = (token_chunk_ids == 0).unsqueeze(-1).to(dtype=x.dtype)
+        cond = cond * (1.0 - first_chunk_mask)
+        x = x + cond
+
         for block in self.decoder_blocks:
-            x = block(x, global_chunks, allow)
+            x = block(x)
         x = self.decoder_norm(x)
         logits_proj = self.lm_head(x.reshape(-1, x.size(-1)))
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def _jepa_loss(self, global_chunks: Tensor, valid_chunk_mask: Tensor) -> Tensor:
-        if global_chunks.size(1) < 2:
+    def _jepa_loss(self, global_chunks: Tensor) -> Tensor:
+        """JEPA next-chunk prediction with Gaussian regularizer (from LeWM)."""
+        num_chunks = global_chunks.size(1)
+        if num_chunks < 2:
             return global_chunks.new_zeros(())
         pred = self.jepa_predictor(global_chunks[:, :-1, :])
         target = global_chunks[:, 1:, :].detach()
-        valid_pairs = valid_chunk_mask[:, 1:]
-        if not bool(valid_pairs.any()):
-            return global_chunks.new_zeros(())
-        pred_valid = pred[valid_pairs]
-        target_valid = target[valid_pairs]
-        mse = F.mse_loss(pred_valid, target_valid, reduction="mean")
-        sig = sigreg_loss(pred_valid)
-        return mse + self.sigreg_weight * sig
+        mse = F.mse_loss(pred, target, reduction="mean")
+        reg = gaussian_reg_loss(pred)
+        return mse + self.sigreg_weight * reg
 
     def export_state_dict(self) -> dict[str, Tensor]:
-        # Submission-time export excludes the JEPA predictor head.
         state = self.state_dict()
         return {k: v for k, v in state.items() if not k.startswith("jepa_predictor.")}
 
@@ -1117,21 +1109,56 @@ class JEPAByteModel(nn.Module):
             raise RuntimeError(f"submission state mismatch missing={missing} unexpected={unexpected}")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        token_latents, _boundary_ste, boundary_hard = self._encoder_forward(input_ids)
-        chunk_latents, token_chunk_ids, valid_chunk_mask = chunk_reduce(token_latents, boundary_hard)
-        global_chunks = self._global_forward(chunk_latents, valid_chunk_mask)
-        logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids, valid_chunk_mask)
+        token_latents = self._encoder_forward(input_ids)
+        chunk_latents, token_chunk_ids = chunk_reduce_fixed(token_latents, self.patch_size)
+        global_chunks = self._global_forward(chunk_latents)
+        logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids)
         return logits.reshape(input_ids.size(0), input_ids.size(1), self.args.vocab_size)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        token_latents, _boundary_ste, boundary_hard = self._encoder_forward(input_ids)
-        chunk_latents, token_chunk_ids, valid_chunk_mask = chunk_reduce(token_latents, boundary_hard)
-        global_chunks = self._global_forward(chunk_latents, valid_chunk_mask)
-        logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids, valid_chunk_mask)
+    def forward(self, input_ids: Tensor, target_ids: Tensor, jepa_scale: float = 1.0) -> Tensor:
+        token_latents = self._encoder_forward(input_ids)
+        chunk_latents, token_chunk_ids = chunk_reduce_fixed(token_latents, self.patch_size)
+        global_chunks = self._global_forward(chunk_latents)
+        logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids)
         ce = F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
-        if self.training and self.jepa_weight > 0.0:
-            return ce + self.jepa_weight * self._jepa_loss(global_chunks, valid_chunk_mask)
+        if self.training and self.jepa_weight > 0.0 and jepa_scale > 0.0:
+            return ce + (self.jepa_weight * jepa_scale) * self._jepa_loss(global_chunks)
         return ce
+
+
+# -----------------------------
+# EMA HELPER
+# -----------------------------
+
+class EMAState:
+    """Exponential moving average of model parameters."""
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: dict[str, Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
+
+    def apply(self, model: nn.Module) -> dict[str, Tensor]:
+        """Apply EMA weights and return backup of original weights."""
+        backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = p.data.clone()
+                p.data.copy_(self.shadow[name])
+        return backup
+
+    def restore(self, model: nn.Module, backup: dict[str, Tensor]) -> None:
+        """Restore original weights from backup."""
+        for name, p in model.named_parameters():
+            if name in backup:
+                p.data.copy_(backup[name])
 
 
 # -----------------------------
@@ -1169,7 +1196,6 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -1235,10 +1261,7 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token/hash/conv/decoder output heads in Adam
-    # - matrix params in attention/MLP projections via Muon
-    # - vectors/scalars via Adam
+    # Optimizer split
     matrix_params: list[Tensor] = []
     scalar_params: list[Tensor] = []
     for name, p in base_model.named_parameters():
@@ -1256,7 +1279,6 @@ def main() -> None:
         "hash_emb.fourgram.weight",
     )
     embed_params = [dict(base_model.named_parameters())[k] for k in embed_named]
-    # Remove embedding params from scalar bucket to keep LR split stable.
     scalar_params = [p for p in scalar_params if p not in embed_params]
 
     optimizer_embed = torch.optim.Adam(
@@ -1287,6 +1309,9 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_embed, optimizer_muon, optimizer_scalar, optimizer_head]
 
+    # IMPROVEMENT #5: EMA
+    ema = EMAState(base_model, args.ema_decay) if args.ema_enabled else None
+
     n_params = sum(p.numel() for p in base_model.parameters())
     n_export_params = sum(p.numel() for _, p in base_model.export_state_dict().items())
     log0(f"model_params_total:{n_params} model_params_export:{n_export_params}")
@@ -1302,6 +1327,8 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"patch_size:{args.patch_size} ema_enabled:{args.ema_enabled} qat_enabled:{args.qat_enabled}")
+    log0(f"muon_momentum:{args.muon_momentum} warmdown_iters:{args.warmdown_iters}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1327,8 +1354,7 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
-    # initial weights/optimizer state so measured training starts from the true init.
+    # Warmup primes compiled paths
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1354,6 +1380,9 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        # Re-init EMA after warmup restore
+        if ema is not None:
+            ema = EMAState(base_model, args.ema_decay)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1372,22 +1401,24 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+
+            # Use EMA weights for validation if available
+            ema_backup = None
+            if ema is not None:
+                ema_backup = ema.apply(base_model)
+
             val_loss, val_bpb = eval_val(
-                args,
-                model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
+                args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+
+            if ema is not None and ema_backup is not None:
+                ema.restore(base_model, ema_backup)
+
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1401,14 +1432,33 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # IMPROVEMENT #7: JEPA loss annealing — reduce to 0 during warmdown
+        if args.jepa_anneal:
+            jepa_scale = min(scale / 0.3, 1.0)  # Anneal JEPA loss faster than LR
+        else:
+            jepa_scale = 1.0
+
+        # IMPROVEMENT #6: QAT during warmdown
+        qat_active = args.qat_enabled and scale < args.qat_threshold
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
+            # Apply STE quantization noise if QAT is active
+            if qat_active:
+                with torch.no_grad():
+                    for name, p in base_model.named_parameters():
+                        if p.ndim == 2 and p.numel() > INTX_KEEP_FLOAT_MAX_NUMEL:
+                            bits = choose_quant_bits(name)
+                            p.data = ste_quantize_weight(p.data, bits)
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, jepa_scale=jepa_scale)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1428,6 +1478,10 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # IMPROVEMENT #5: Update EMA
+        if ema is not None:
+            ema.update(base_model)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1438,9 +1492,9 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f" lr_scale:{scale:.4f} jepa_scale:{jepa_scale:.4f}"
             )
 
-        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1455,10 +1509,15 @@ def main() -> None:
     )
 
     # -----------------------------
+    # APPLY EMA BEFORE SERIALIZATION
+    # -----------------------------
+    if ema is not None:
+        log0("Applying EMA weights for final model")
+        ema.apply(base_model)
+
+    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int6/8+lzma artifact and validate the round-tripped weights.
 
     export_state = base_model.export_state_dict()
     if master_process:
@@ -1497,16 +1556,8 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        args, model, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
@@ -1518,15 +1569,8 @@ def main() -> None:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_sliding_ttt(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             log_fn=log0,
         )
         torch.cuda.synchronize()
