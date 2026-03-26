@@ -82,21 +82,25 @@ class Hyperparameters:
     num_unique_global_blocks = int(os.environ.get("NUM_UNIQUE_GLOBAL_BLOCKS", 5))
     num_global_cycles = int(os.environ.get("NUM_GLOBAL_CYCLES", 2))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
-    # Decoder: more layers now that cross-attention is removed
-    decoder_dim = int(os.environ.get("DECODER_DIM", 480))
-    decoder_layers = int(os.environ.get("DECODER_LAYERS", 9))  # was 7
+    decoder_dim = int(os.environ.get("DECODER_DIM", 448))
+    decoder_layers = int(os.environ.get("DECODER_LAYERS", 6))
     decoder_heads = int(os.environ.get("DECODER_HEADS", 8))
+    decoder_kv_heads = int(os.environ.get("DECODER_KV_HEADS", 4))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
 
-    # Fixed-stride patching (replaces learned boundary prediction)
     patch_size = int(os.environ.get("PATCH_SIZE", 8))
+    jepa_chunk_size = int(os.environ.get("JEPA_CHUNK_SIZE", 32))
+    jepa_latent_dim = int(os.environ.get("JEPA_LATENT_DIM", 256))
+    jepa_proj_hidden = int(os.environ.get("JEPA_PROJ_HIDDEN", 256))
+    jepa_target_momentum = float(os.environ.get("JEPA_TARGET_MOMENTUM", 0.996))
 
-    # JEPA loss (annealed during warmdown)
-    jepa_weight = float(os.environ.get("JEPA_WEIGHT", 0.10))
-    jepa_anneal = bool(int(os.environ.get("JEPA_ANNEAL", "1")))  # anneal to 0
+    # JEPA loss schedule: 30% pure AR, 50% ramp, 20% pure AR
+    jepa_weight = float(os.environ.get("JEPA_WEIGHT", 0.003))
+    jepa_phase1_frac = float(os.environ.get("JEPA_PHASE1_FRAC", 0.30))
+    jepa_phase2_frac = float(os.environ.get("JEPA_PHASE2_FRAC", 0.50))
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.10))
 
     # EMA weight averaging
@@ -870,13 +874,19 @@ class Block(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """Simplified decoder block: causal self-attention + MLP.
-    Cross-attention replaced with additive chunk conditioning (applied externally)."""
-    def __init__(self, dim: int, num_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
         super().__init__()
         self.self_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.self_attn = CausalSelfAttention(dim, num_heads, num_heads, rope_base, qk_gain_init)
+        self.self_attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.self_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -909,23 +919,35 @@ class HashNgramEmbedding(nn.Module):
         return self.trigram(tri_ids) + self.fourgram(four_ids)
 
 
-# ---- IMPROVEMENT #1: Vectorized fixed-stride chunk reduce ----
-def chunk_reduce_fixed(x: Tensor, patch_size: int) -> tuple[Tensor, Tensor]:
-    """Vectorized chunk reduction with fixed stride — no Python loops."""
+# ---- IMPROVEMENT #1: Vectorized chunk reduce ----
+def chunk_reduce(x: Tensor, chunk_size: int) -> tuple[Tensor, Tensor]:
     bsz, seqlen, dim = x.shape
-    # Pad sequence to be divisible by patch_size
-    pad_len = (patch_size - seqlen % patch_size) % patch_size
+    pad_len = (chunk_size - seqlen % chunk_size) % chunk_size
     if pad_len > 0:
         x_padded = F.pad(x, (0, 0, 0, pad_len))
     else:
         x_padded = x
-    num_patches = x_padded.size(1) // patch_size
-    # Reshape and mean-pool: [B, num_patches, patch_size, dim] -> [B, num_patches, dim]
-    chunk_latents = x_padded.reshape(bsz, num_patches, patch_size, dim).mean(dim=2)
-    # Token-to-chunk mapping: each token maps to its patch index
-    token_chunk_ids = torch.arange(seqlen, device=x.device) // patch_size
+    num_chunks = x_padded.size(1) // chunk_size
+    chunk_latents = x_padded.reshape(bsz, num_chunks, chunk_size, dim).mean(dim=2)
+    token_chunk_ids = torch.arange(seqlen, device=x.device) // chunk_size
     token_chunk_ids = token_chunk_ids.unsqueeze(0).expand(bsz, -1)
     return chunk_latents, token_chunk_ids
+
+
+def chunk_broadcast(x: Tensor, chunk_size: int, seq_len: int) -> Tensor:
+    out = x.repeat_interleave(chunk_size, dim=1)
+    if out.size(1) > seq_len:
+        return out[:, :seq_len]
+    if out.size(1) < seq_len:
+        pad = torch.zeros(
+            out.size(0),
+            seq_len - out.size(1),
+            out.size(2),
+            device=out.device,
+            dtype=out.dtype,
+        )
+        return torch.cat((out, pad), dim=1)
+    return out
 
 
 # ---- IMPROVEMENT #9: Gaussian latent regularizer (from LeWM) ----
@@ -954,6 +976,35 @@ def gaussian_reg_loss(z: Tensor) -> Tensor:
     return mean_pen + var_pen + 0.01 * cov_pen
 
 
+class JEPAProjector(nn.Module):
+    def __init__(self, model_dim: int, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.fc1 = CastedLinear(model_dim, hidden_dim, bias=False)
+        self.fc2 = CastedLinear(hidden_dim, latent_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc1(x)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = F.silu(x)
+        return self.fc2(x)
+
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, latent_dim: int, hidden_dim: int):
+        super().__init__()
+        self.start_token = nn.Parameter(torch.zeros(latent_dim, dtype=torch.float32))
+        self.fc1 = CastedLinear(latent_dim, hidden_dim, bias=False)
+        self.fc2 = CastedLinear(hidden_dim, latent_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bos = self.start_token.to(dtype=x.dtype)[None, None, :].expand(x.size(0), 1, -1)
+        shifted = torch.cat((bos, x[:, :-1]), dim=1)
+        shifted = self.fc1(shifted)
+        shifted = F.rms_norm(shifted, (shifted.size(-1),))
+        shifted = F.silu(shifted)
+        return self.fc2(shifted)
+
+
 class JEPAByteModel(nn.Module):
     def __init__(self, args: Hyperparameters):
         super().__init__()
@@ -961,12 +1012,15 @@ class JEPAByteModel(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {args.logit_softcap}")
         if args.encoder_kernel_size < 2:
             raise ValueError("ENCODER_KERNEL_SIZE must be >= 2")
+        if args.jepa_chunk_size < args.patch_size or args.jepa_chunk_size % args.patch_size != 0:
+            raise ValueError("JEPA_CHUNK_SIZE must be divisible by PATCH_SIZE and >= PATCH_SIZE")
 
         self.args = args
         self.logit_softcap = args.logit_softcap
         self.jepa_weight = args.jepa_weight
         self.sigreg_weight = args.sigreg_weight
         self.patch_size = args.patch_size
+        self.jepa_chunk_size = args.jepa_chunk_size
 
         # Encoder: token emb + trigram/4-gram hash emb -> causal conv (128 -> model_dim).
         self.tok_emb = nn.Embedding(args.vocab_size, args.encoder_token_dim)
@@ -1010,6 +1064,7 @@ class JEPAByteModel(nn.Module):
                 DecoderBlock(
                     dim=args.decoder_dim,
                     num_heads=args.decoder_heads,
+                    num_kv_heads=args.decoder_kv_heads,
                     mlp_mult=2,
                     rope_base=args.rope_base,
                     qk_gain_init=args.qk_gain_init,
@@ -1020,13 +1075,13 @@ class JEPAByteModel(nn.Module):
         self.decoder_norm = RMSNorm()
         self.lm_head = CastedLinear(args.decoder_dim, args.vocab_size, bias=False)
 
-        # JEPA predictor (training-only, excluded from export)
-        self.jepa_predictor = nn.Sequential(
-            RMSNorm(),
-            CastedLinear(args.model_dim, args.model_dim, bias=False),
-            nn.GELU(),
-            CastedLinear(args.model_dim, args.model_dim, bias=False),
-        )
+        self.jepa_chunk_span = max(args.jepa_chunk_size // args.patch_size, 1)
+        self.jepa_projector = JEPAProjector(args.model_dim, args.jepa_latent_dim, args.jepa_proj_hidden)
+        self.jepa_predictor = JEPAPredictor(args.jepa_latent_dim, args.jepa_proj_hidden)
+        self.jepa_to_global = CastedLinear(args.jepa_latent_dim, args.model_dim, bias=False)
+        self.jepa_to_global._zero_init = True
+        self.jepa_target_projector = copy.deepcopy(self.jepa_projector)
+        self.jepa_target_projector.requires_grad_(False)
 
         self._init_weights()
 
@@ -1053,6 +1108,31 @@ class JEPAByteModel(nn.Module):
                 x = block(x, x0)
         x = self.global_transformer["norm"](x)
         return x
+
+    @torch.no_grad()
+    def update_jepa_target(self, momentum: float) -> None:
+        for target, online in zip(
+            self.jepa_target_projector.parameters(),
+            self.jepa_projector.parameters(),
+            strict=True,
+        ):
+            target.lerp_(online, 1.0 - momentum)
+
+    def _jepa_forward(
+        self,
+        global_chunks: Tensor,
+        need_target: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        semantic_chunks, _ = chunk_reduce(global_chunks, self.jepa_chunk_span)
+        online_latents = self.jepa_projector(semantic_chunks)
+        pred_latents = self.jepa_predictor(online_latents)
+        inject = self.jepa_to_global(pred_latents.to(dtype=global_chunks.dtype))
+        fused_chunks = global_chunks + chunk_broadcast(inject, self.jepa_chunk_span, global_chunks.size(1))
+        target_latents = None
+        if need_target:
+            with torch.no_grad():
+                target_latents = self.jepa_target_projector(semantic_chunks.detach())
+        return fused_chunks, online_latents, pred_latents, target_latents
 
     def _decoder_forward(
         self,
@@ -1088,43 +1168,44 @@ class JEPAByteModel(nn.Module):
         logits_proj = self.lm_head(x.reshape(-1, x.size(-1)))
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def _jepa_loss(self, global_chunks: Tensor) -> Tensor:
-        """JEPA next-chunk prediction with Gaussian regularizer (from LeWM)."""
-        num_chunks = global_chunks.size(1)
-        if num_chunks < 2:
-            return global_chunks.new_zeros(())
-        pred = self.jepa_predictor(global_chunks[:, :-1, :])
-        target = global_chunks[:, 1:, :].detach()
-        mse = F.mse_loss(pred, target, reduction="mean")
-        reg = gaussian_reg_loss(pred)
+    def _jepa_loss(self, online_latents: Tensor, pred_latents: Tensor, target_latents: Tensor) -> Tensor:
+        mse = F.mse_loss(pred_latents, target_latents, reduction="mean")
+        reg = gaussian_reg_loss(online_latents)
         return mse + self.sigreg_weight * reg
 
     def export_state_dict(self) -> dict[str, Tensor]:
         state = self.state_dict()
-        return {k: v for k, v in state.items() if not k.startswith("jepa_predictor.")}
+        return {k: v for k, v in state.items() if not k.startswith("jepa_target_projector.")}
 
     def load_submission_state_dict(self, state_dict: dict[str, Tensor]) -> None:
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        unexpected = [k for k in unexpected if not k.startswith("jepa_predictor.")]
-        missing = [k for k in missing if not k.startswith("jepa_predictor.")]
+        unexpected = [k for k in unexpected if not k.startswith("jepa_target_projector.")]
+        missing = [k for k in missing if not k.startswith("jepa_target_projector.")]
         if unexpected or missing:
             raise RuntimeError(f"submission state mismatch missing={missing} unexpected={unexpected}")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         token_latents = self._encoder_forward(input_ids)
-        chunk_latents, token_chunk_ids = chunk_reduce_fixed(token_latents, self.patch_size)
+        chunk_latents, token_chunk_ids = chunk_reduce(token_latents, self.patch_size)
         global_chunks = self._global_forward(chunk_latents)
+        global_chunks, _, _, _ = self._jepa_forward(global_chunks, need_target=False)
         logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids)
         return logits.reshape(input_ids.size(0), input_ids.size(1), self.args.vocab_size)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, jepa_scale: float = 1.0) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, jepa_scale: float = 0.0) -> Tensor:
         token_latents = self._encoder_forward(input_ids)
-        chunk_latents, token_chunk_ids = chunk_reduce_fixed(token_latents, self.patch_size)
+        chunk_latents, token_chunk_ids = chunk_reduce(token_latents, self.patch_size)
         global_chunks = self._global_forward(chunk_latents)
+        global_chunks, online_latents, pred_latents, target_latents = self._jepa_forward(
+            global_chunks,
+            need_target=self.training and jepa_scale > 0.0,
+        )
         logits = self._decoder_forward(token_latents, global_chunks, token_chunk_ids)
         ce = F.cross_entropy(logits.float(), target_ids.reshape(-1), reduction="mean")
-        if self.training and self.jepa_weight > 0.0 and jepa_scale > 0.0:
-            return ce + (self.jepa_weight * jepa_scale) * self._jepa_loss(global_chunks)
+        if self.training and jepa_scale > 0.0:
+            if target_latents is None:
+                raise RuntimeError("JEPA target latents missing during training")
+            return ce + jepa_scale * self._jepa_loss(online_latents, pred_latents, target_latents)
         return ce
 
 
@@ -1173,6 +1254,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.jepa_phase1_frac < 0.0 or args.jepa_phase2_frac < 0.0 or args.jepa_phase1_frac + args.jepa_phase2_frac > 1.0:
+        raise ValueError("JEPA phase fractions must be non-negative and sum to at most 1")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1288,8 +1371,7 @@ def main() -> None:
     matrix_params: list[Tensor] = []
     scalar_params: list[Tensor] = []
     for name, p in base_model.named_parameters():
-        if name.startswith("jepa_predictor."):
-            scalar_params.append(p) if p.ndim < 2 else matrix_params.append(p)
+        if not p.requires_grad:
             continue
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
             matrix_params.append(p)
@@ -1342,6 +1424,10 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"global_layers_effective:{args.num_unique_global_blocks * args.num_global_cycles}")
     log0(
+        f"attention_heads:{args.num_heads}/{args.num_kv_heads} "
+        f"decoder_heads:{args.decoder_heads}/{args.decoder_kv_heads}"
+    )
+    log0(
         f"embed_lr:{args.embed_lr} head_lr:{args.head_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"jepa_weight:{args.jepa_weight} sigreg_weight:{args.sigreg_weight}"
     )
@@ -1350,7 +1436,11 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"patch_size:{args.patch_size} ema_enabled:{args.ema_enabled} qat_enabled:{args.qat_enabled}")
+    log0(
+        f"patch_size:{args.patch_size} jepa_chunk_size:{args.jepa_chunk_size} "
+        f"decoder_dim:{args.decoder_dim} decoder_layers:{args.decoder_layers}"
+    )
+    log0(f"ema_enabled:{args.ema_enabled} qat_enabled:{args.qat_enabled}")
     log0(f"muon_momentum:{args.muon_momentum} warmdown_iters:{args.warmdown_iters}")
     log0(f"seed:{args.seed}")
 
@@ -1389,7 +1479,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, jepa_scale=0.0)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1466,11 +1556,15 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        # IMPROVEMENT #7: JEPA loss annealing — reduce to 0 during warmdown
-        if args.jepa_anneal:
-            jepa_scale = min(scale / 0.3, 1.0)  # Anneal JEPA loss faster than LR
+        phase1_end = int(args.jepa_phase1_frac * args.iterations)
+        phase2_end = int((args.jepa_phase1_frac + args.jepa_phase2_frac) * args.iterations)
+        if step < phase1_end:
+            jepa_scale = 0.0
+        elif step < phase2_end:
+            ramp = (step - phase1_end) / max(phase2_end - phase1_end, 1)
+            jepa_scale = ramp * args.jepa_weight
         else:
-            jepa_scale = 1.0
+            jepa_scale = 0.0
 
         # IMPROVEMENT #6: QAT during warmdown
         qat_active = args.qat_enabled and scale < args.qat_threshold
@@ -1510,6 +1604,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        base_model.update_jepa_target(args.jepa_target_momentum)
 
         # IMPROVEMENT #5: Update EMA
         if ema is not None:
@@ -1525,14 +1620,14 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f" lr_scale:{scale:.4f} jepa_scale:{jepa_scale:.4f}"
+                f" lr_scale:{scale:.4f} jepa_weight:{jepa_scale:.4f}"
             )
             if wandb_run is not None:
                 wandb.log(
                     {
                         "train/loss": float(train_loss.item()),
                         "train/lr_scale": float(scale),
-                        "train/jepa_scale": float(jepa_scale),
+                        "train/jepa_weight": float(jepa_scale),
                         "train/qat_active": int(qat_active),
                         "time/train_ms": approx_training_time_ms,
                         "time/step_avg_ms": approx_training_time_ms / step,
