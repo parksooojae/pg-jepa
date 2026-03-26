@@ -34,8 +34,6 @@ def local_path_for_remote(relative_path: str) -> Path:
 
 def get(relative_path: str) -> None:
     destination = local_path_for_remote(relative_path)
-    if destination.exists():
-        return
     if destination.is_symlink():
         destination.unlink()
 
@@ -52,6 +50,10 @@ def get(relative_path: str) -> None:
     # always materialize a real file in data/, not a broken relative symlink.
     cached_source = cached_path.resolve(strict=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.is_file() and destination.stat().st_size == cached_source.stat().st_size:
+            return
+        destination.unlink()
     try:
         os.link(cached_source, destination)
     except OSError:

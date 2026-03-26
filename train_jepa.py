@@ -672,8 +672,11 @@ def load_data_shard(file: Path) -> Tensor:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
     expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+    actual_size = file.stat().st_size
+    if actual_size != expected_size:
+        raise ValueError(
+            f"Shard size mismatch for {file}: expected {expected_size} bytes, found {actual_size} bytes"
+        )
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
