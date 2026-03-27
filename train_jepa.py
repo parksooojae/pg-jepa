@@ -1387,7 +1387,8 @@ def main() -> None:
         "hash_emb.fourgram.weight",
     )
     embed_params = [dict(base_model.named_parameters())[k] for k in embed_named]
-    scalar_params = [p for p in scalar_params if p not in embed_params]
+    embed_param_ids = {id(p) for p in embed_params}
+    scalar_params = [p for p in scalar_params if id(p) not in embed_param_ids]
 
     optimizer_embed = torch.optim.Adam(
         [{"params": embed_params, "lr": args.embed_lr, "base_lr": args.embed_lr}],
