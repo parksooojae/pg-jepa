@@ -7,7 +7,7 @@ Based on PR#696 (gravelBridge):
 (4) leakyReLU(0.5)² activation (matching SOTA)
 (5) EMA weight averaging (decay=0.997)
 (6) QAT (quantization-aware training) during warmdown
-(7) JEPA loss annealing (full early → zero at convergence)
+(7) JEPA loss active throughout training (optional warmup)
 (8) SOTA optimizer hyperparameters (Muon momentum=0.99, warmdown=3500)
 (9) Gaussian latent regularizer (from LeWM: mean→0, var→1, decorrelation)
 (10) more decoder layers (9 vs 7, using saved cross-attention params)
@@ -64,10 +64,13 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
-    # Training length — SOTA-matched warmdown
+    # Training length + scheduler controls.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))  # was 1200
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    compile_warmup_steps = int(os.environ.get("COMPILE_WARMUP_STEPS", os.environ.get("WARMUP_STEPS", 20)))
+    lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 200))
+    lr_schedule = os.environ.get("LR_SCHEDULE", "cosine").strip().lower()
+    min_lr_scale = float(os.environ.get("MIN_LR_SCALE", 0.10))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -97,10 +100,8 @@ class Hyperparameters:
     jepa_proj_hidden = int(os.environ.get("JEPA_PROJ_HIDDEN", 256))
     jepa_target_momentum = float(os.environ.get("JEPA_TARGET_MOMENTUM", 0.996))
 
-    # JEPA loss schedule: 30% pure AR, 50% ramp, 20% pure AR
     jepa_weight = float(os.environ.get("JEPA_WEIGHT", 0.003))
-    jepa_phase1_frac = float(os.environ.get("JEPA_PHASE1_FRAC", 0.30))
-    jepa_phase2_frac = float(os.environ.get("JEPA_PHASE2_FRAC", 0.50))
+    jepa_warmup_steps = int(os.environ.get("JEPA_WARMUP_STEPS", 0))
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.10))
 
     # EMA weight averaging
@@ -1257,8 +1258,13 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.jepa_phase1_frac < 0.0 or args.jepa_phase2_frac < 0.0 or args.jepa_phase1_frac + args.jepa_phase2_frac > 1.0:
-        raise ValueError("JEPA phase fractions must be non-negative and sum to at most 1")
+    valid_lr_schedules = {"constant", "linear", "cosine", "warmdown"}
+    if args.lr_schedule not in valid_lr_schedules:
+        raise ValueError(f"LR_SCHEDULE must be one of {sorted(valid_lr_schedules)}, got {args.lr_schedule!r}")
+    if args.compile_warmup_steps < 0 or args.lr_warmup_steps < 0 or args.jepa_warmup_steps < 0:
+        raise ValueError("Compile/LR/JEPA warmup steps must be non-negative")
+    if not 0.0 <= args.min_lr_scale <= 1.0:
+        raise ValueError(f"MIN_LR_SCALE must be in [0, 1], got {args.min_lr_scale}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1319,12 +1325,18 @@ def main() -> None:
                 "tokenizer_path": args.tokenizer_path,
                 "vocab_size": args.vocab_size,
                 "iterations": args.iterations,
+                "compile_warmup_steps": args.compile_warmup_steps,
+                "lr_warmup_steps": args.lr_warmup_steps,
+                "lr_schedule": args.lr_schedule,
+                "min_lr_scale": args.min_lr_scale,
                 "train_batch_tokens": args.train_batch_tokens,
                 "train_seq_len": args.train_seq_len,
                 "model_dim": args.model_dim,
                 "num_unique_global_blocks": args.num_unique_global_blocks,
                 "num_global_cycles": args.num_global_cycles,
                 "decoder_layers": args.decoder_layers,
+                "jepa_weight": args.jepa_weight,
+                "jepa_warmup_steps": args.jepa_warmup_steps,
                 "max_wallclock_seconds": args.max_wallclock_seconds,
             },
         )
@@ -1437,7 +1449,8 @@ def main() -> None:
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"iterations:{args.iterations} compile_warmup_steps:{args.compile_warmup_steps} "
+        f"lr_warmup_steps:{args.lr_warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
@@ -1445,7 +1458,11 @@ def main() -> None:
         f"decoder_dim:{args.decoder_dim} decoder_layers:{args.decoder_layers}"
     )
     log0(f"ema_enabled:{args.ema_enabled} qat_enabled:{args.qat_enabled}")
-    log0(f"muon_momentum:{args.muon_momentum} warmdown_iters:{args.warmdown_iters}")
+    log0(
+        f"muon_momentum:{args.muon_momentum} lr_schedule:{args.lr_schedule} "
+        f"min_lr_scale:{args.min_lr_scale} warmdown_iters:{args.warmdown_iters} "
+        f"jepa_warmup_steps:{args.jepa_warmup_steps}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1460,23 +1477,59 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
-            return 1.0
+    def training_progress(step: int, elapsed_ms: float) -> float:
+        step_progress = step / max(args.iterations, 1)
         if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            return min(step_progress, 1.0)
+        time_progress = elapsed_ms / max(max_wallclock_ms, 1e-9)
+        return min(max(step_progress, time_progress), 1.0)
+
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.lr_warmup_steps > 0 and step < args.lr_warmup_steps:
+            return (step + 1) / args.lr_warmup_steps
+        if args.lr_schedule == "constant":
+            return 1.0
+        if args.lr_schedule == "warmdown":
+            if args.warmdown_iters <= 0:
+                return 1.0
+            if max_wallclock_ms is None:
+                warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+                if step < warmdown_start or step >= args.iterations:
+                    return 1.0
+                decay = (args.iterations - step) / max(args.warmdown_iters, 1)
+                return max(args.min_lr_scale, decay)
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            if remaining_ms > warmdown_ms:
+                return 1.0
+            decay = remaining_ms / max(warmdown_ms, 1e-9)
+            return max(args.min_lr_scale, decay)
+
+        progress = training_progress(step, elapsed_ms)
+        warmup_progress = args.lr_warmup_steps / max(args.iterations, 1)
+        decay_progress = (progress - warmup_progress) / max(1.0 - warmup_progress, 1e-9)
+        decay_progress = min(max(decay_progress, 0.0), 1.0)
+        if args.lr_schedule == "linear":
+            return args.min_lr_scale + (1.0 - args.min_lr_scale) * (1.0 - decay_progress)
+        if args.lr_schedule == "cosine":
+            cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+            return args.min_lr_scale + (1.0 - args.min_lr_scale) * cosine
+        raise RuntimeError(f"Unhandled LR schedule: {args.lr_schedule}")
+
+    def jepa_scale_for_step(step: int) -> float:
+        if args.jepa_weight <= 0.0:
+            return 0.0
+        if args.jepa_warmup_steps <= 0:
+            return args.jepa_weight
+        return args.jepa_weight * min((step + 1) / args.jepa_warmup_steps, 1.0)
 
     # Warmup primes compiled paths
-    if args.warmup_steps > 0:
+    if args.compile_warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
-        for warmup_step in range(args.warmup_steps):
+        for warmup_step in range(args.compile_warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1488,8 +1541,12 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+            if (
+                args.compile_warmup_steps <= 20
+                or (warmup_step + 1) % 10 == 0
+                or warmup_step + 1 == args.compile_warmup_steps
+            ):
+                log0(f"compile_warmup_step:{warmup_step + 1}/{args.compile_warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1559,18 +1616,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        jepa_scale = jepa_scale_for_step(step)
 
-        phase1_end = int(args.jepa_phase1_frac * args.iterations)
-        phase2_end = int((args.jepa_phase1_frac + args.jepa_phase2_frac) * args.iterations)
-        if step < phase1_end:
-            jepa_scale = 0.0
-        elif step < phase2_end:
-            ramp = (step - phase1_end) / max(phase2_end - phase1_end, 1)
-            jepa_scale = ramp * args.jepa_weight
-        else:
-            jepa_scale = 0.0
-
-        # IMPROVEMENT #6: QAT during warmdown
+        # IMPROVEMENT #6: QAT during the low-LR tail of training
         qat_active = args.qat_enabled and scale < args.qat_threshold
 
         zero_grad_all()
@@ -1624,13 +1672,14 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-                f" lr_scale:{scale:.4f} jepa_weight:{jepa_scale:.4f}"
+                f" lr_scale:{scale:.4f} jepa_scale:{jepa_scale:.4f}"
             )
             if wandb_run is not None:
                 wandb.log(
                     {
                         "train/loss": float(train_loss.item()),
                         "train/lr_scale": float(scale),
+                        "train/jepa_scale": float(jepa_scale),
                         "train/jepa_weight": float(jepa_scale),
                         "train/qat_active": int(qat_active),
                         "time/train_ms": approx_training_time_ms,
